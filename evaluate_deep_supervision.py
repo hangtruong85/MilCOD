@@ -24,10 +24,10 @@ class EvalConfig:
     """Evaluation configuration"""
     def __init__(self):
         # Model to evaluate
-        self.model_name = "PVT_DeepSupervision"
+        self.model_name = "PVT_DeepSupervision_BEMMulti"
         
         # Checkpoint path
-        self.ckpt_path = "logs/PVT_DeepSupervision_20260204_112100/best_s_measure.pth"
+        self.ckpt_path = "logs/PVT_DeepSupervision_BEMMulti_20260206_102516/best_s_measure.pth"
         
         # Dataset
         self.root = "../MHCD_seg"

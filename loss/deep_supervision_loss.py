@@ -95,8 +95,6 @@ class DeepSupervisionLoss(nn.Module):
         lambda_wbce: Weight for BCE in supervision loss (default: 0.25)
         lambda_wiou: Weight for IoU in supervision loss (default: 0.4)
         lambda_boundary: Weight multiplier for boundary loss (default: 4.0)
-        focal_alpha: Alpha parameter for Focal loss (default: 0.25)
-        focal_gamma: Gamma parameter for Focal loss (default: 2.0)
     """
     def __init__(self, lambda_wbce=0.25, lambda_wiou=0.4,
                  lambda_boundary=4.0):
@@ -107,9 +105,7 @@ class DeepSupervisionLoss(nn.Module):
         # Supervision loss for each decoder level
         self.supervision_loss = SupervisionLoss(
             lambda_wbce=lambda_wbce,
-            lambda_wiou=lambda_wiou,
-            focal_alpha=focal_alpha,
-            focal_gamma=focal_gamma
+            lambda_wiou=lambda_wiou
         )
     
     def boundary_dice_loss(self, boundary_pred, boundary_target):

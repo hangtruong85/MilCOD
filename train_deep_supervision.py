@@ -306,7 +306,7 @@ def main():
     logger.info(f"LR Encoder    : {config.lr_encoder}")
     logger.info(f"LR Decoder    : {config.lr_decoder}")
     logger.info(f"Supervision Loss Weights:")
-    logger.info(f"  BCE: {config.lambda_wbce}, IoU: {config.lambda_wiou}")
+    logger.info(f"  wBCE: {config.lambda_wbce}, wIoU: {config.lambda_wiou}")
     logger.info(f"  Boundary multiplier: {config.lambda_boundary}")
     logger.info(f"Device        : {config.device}")
     logger.info(f"Log Directory : {config.log_dir}")
@@ -351,9 +351,7 @@ def main():
     criterion = DeepSupervisionLoss(
         lambda_wbce=config.lambda_wbce,
         lambda_wiou=config.lambda_wiou,
-        lambda_boundary=config.lambda_boundary,
-        focal_alpha=config.focal_alpha,
-        focal_gamma=config.focal_gamma
+        lambda_boundary=config.lambda_boundary
     )
     
     optimizer = create_optimizer(model, config)
