@@ -1,3 +1,8 @@
+"""
+Training script for DualStream_PVT_COD
+Simplified version - only supports dual-stream RGB+Depth model
+"""
+
 import os
 import csv
 import torch
@@ -10,8 +15,7 @@ import torch.nn.functional as F
 from datetime import datetime
 
 from datasets.mhcd_dataset import MHCDDataset
-
-from model_registry import create_model
+from models.dual_stream_pvt import DualStream_PVT_COD
 
 from metrics.s_measure_paper import s_measure
 from metrics.e_measure_paper import e_measure
@@ -19,64 +23,52 @@ from metrics.fweighted_measure import fw_measure
 from metrics.mae_metric import mae_metric
 from utils.logger import setup_logger
 from utils.plot import plot_training_curves
-from loss.losses import SegmentationLoss
+from loss.deep_supervision_loss import DeepSupervisionLoss
+
 
 # ===================== Configuration =====================
 
 class Config:
-    """Centralized configuration for training"""
+    """Configuration for DualStream_PVT_COD training"""
     def __init__(self):
-        # Model selection - now with DCN + CBAM + BEM variants!
-        self.model_name = "UNet3Plus_B3_BEM_CBAM"  # New full model
+        # Model settings
+        self.n_classes = 1
+        self.is_bem = True           # Use Boundary Enhancement Module
+        self.is_cbam_en3 = True      # Use CBAM on encoder stage 3
+        self.is_cbam_en4 = True      # Use CBAM on encoder stage 4
+        self.pretrained = True       # Use pretrained PVT backbones
         
         # Dataset
         self.root = "../MHCD_seg"
-        self.img_size = 352  # Increased from 256 - better for COD
+        self.img_size = 352
+        self.use_depth = True        # Load depth maps
         
         # Training
         self.epochs = 120
-        self.batch_size = 12  # Reduced due to larger image size
+        self.batch_size = 12
         self.num_workers = 4
         
         # Optimizer
-        self.lr_encoder = 1e-5  # Lower LR for pretrained encoder
-        self.lr_dcn = 1e-4      # Higher LR for DCN modules
+        self.lr_encoder = 1e-5       # Learning rate for encoders (RGB + Depth)
+        self.lr_decoder = 1e-4       # Learning rate for decoder/BFM/BEM
         self.weight_decay = 1e-4
+        
+        # Deep Supervision Loss Weights
+        self.lambda_wbce = 0.5          # BCE weight
+        self.lambda_wiou = 0.5          # IoU weight
+        self.lambda_boundary = 4.0      # Boundary loss multiplier
 
-        # Loss weights
-        self.lambda_bce = 0.0
-        self.lambda_dice = 0.4
-        self.lambda_iou = 0.0
-        self.lambda_focal = 0.4  # NEW: Focal loss weight
-        self.lambda_boundary = 0.3
-        
-        if "BEM" in self.model_name:
-            self.lambda_boundary = 0.5
-            self.lambda_dice = 0
-            self.lambda_focal = 0
-            self.lambda_bce = 0.25
-            self.lambda_iou = 0.25
-        else:
-            self.lambda_boundary = 0.0
-            self.lambda_dice = 0
-            self.lambda_focal = 0
-            self.lambda_bce = 0.5
-            self.lambda_iou = 0.5
-        
-        # Focal loss parameters
-        self.focal_alpha = 0.25  # Weight for positive class
-        self.focal_gamma = 2.0   # Focusing parameter
-        
         # Training strategy
-        self.warmup_epochs = 10  # Freeze encoder for first N epochs
-        self.warmup_boundary_epochs = 20  # No boundary loss for first N epochs (stabilize segmentation first)
-        self.use_cosine_schedule = True
+        self.warmup_epochs = 5           # Freeze encoder for first N epochs
+        self.warmup_boundary_epochs = 20 # Start boundary loss after N epochs
+        self.use_cosine_schedule = True  # Use cosine LR schedule
         
         # Device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         # Logging
-        self.log_dir = f"logs/{self.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_dir = f"logs/DualStream_PVT_COD_{timestamp}"
         os.makedirs(self.log_dir, exist_ok=True)
 
 
@@ -84,57 +76,63 @@ class Config:
 
 def train_epoch(model, loader, optimizer, criterion, scaler, device, config, epoch):
     """
-    Train for one epoch
+    Train for one epoch with deep supervision
     
-    Training strategy:
-    - Epoch 1-warmup_epochs: Freeze encoder
-    - Epoch 1-warmup_boundary_epochs: No boundary loss (focus on segmentation)
-    - Epoch warmup_boundary_epochs+: Full training with boundary loss
+    Args:
+        model: DualStream_PVT_COD
+        loader: DataLoader returning (rgb, depth, mask)
+        optimizer: Optimizer
+        criterion: DeepSupervisionLoss
+        scaler: GradScaler for AMP
+        device: cuda/cpu
+        config: Config object
+        epoch: Current epoch number
+    
+    Returns:
+        avg_loss: Average training loss
     """
     model.train()
     
     # Freeze encoder during warmup
     if epoch <= config.warmup_epochs:
-        if hasattr(model, 'backbone') and hasattr(model.backbone, 'encoder'):
-            for param in model.backbone.encoder.parameters():
-                param.requires_grad = False
+        for param in model.dual_encoder.parameters():
+            param.requires_grad = False
     else:
-        if hasattr(model, 'backbone') and hasattr(model.backbone, 'encoder'):
-            for param in model.backbone.encoder.parameters():
-                param.requires_grad = True
+        for param in model.dual_encoder.parameters():
+            param.requires_grad = True
     
     total_loss = 0.0
     num_batches = 0
     
-    # Check if model supports boundary prediction
-    has_boundary = hasattr(model, 'predict_boundary') and model.predict_boundary
+    # Determine if we should use boundary loss
+    use_boundary_loss = (epoch > config.warmup_boundary_epochs) and config.is_bem
     
-    # Determine if we should use boundary loss in this epoch
-    use_boundary_loss = (epoch > config.warmup_boundary_epochs) and has_boundary
-    
-    for batch_idx, (images, masks) in enumerate(loader):
-        images = images.to(device)
+    for batch_idx, (rgb, depth, masks) in enumerate(loader):
+        rgb = rgb.to(device)
+        depth = depth.to(device)
         masks = masks.to(device)
         
         optimizer.zero_grad()
         
         with autocast(device_type='cuda', dtype=torch.float16):
             # Forward pass
-            if use_boundary_loss:
-                # Model can predict boundary
-                mask_pred, boundary_pred = model(images, return_boundary=True)
-                
-                # Extract ground truth boundary from mask
+            predictions, boundary_pred = model(rgb, depth)
+            pred_d1, pred_d2, pred_d3, pred_d4 = predictions
+            
+            if use_boundary_loss and boundary_pred is not None:
+                # Extract ground truth boundary
                 from models.boundary_enhancement import BoundaryEnhancementModule
                 bem_temp = BoundaryEnhancementModule(channels=1).to(device)
                 boundary_target = bem_temp.extract_boundary_map(masks)
+                boundary_target = torch.clamp(boundary_target, 0, 1)
                 
                 # Compute loss with boundary
-                loss = criterion(mask_pred, masks, boundary_pred, boundary_target)
+                loss = criterion(pred_d1, pred_d2, pred_d3, pred_d4, 
+                               masks, boundary_pred, boundary_target)
             else:
-                # Model without boundary prediction
-                mask_pred = model(images)
-                loss = criterion(mask_pred, masks)
+                # Compute loss without boundary
+                loss = criterion(pred_d1, pred_d2, pred_d3, pred_d4, 
+                               masks, None, None)
         
         # Backward pass
         scaler.scale(loss).backward()
@@ -150,56 +148,70 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, config, epo
 # ===================== Validation Functions =====================
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, config):
     """
     Validate model
-    Returns dict with loss and metrics: S, E, F, MAE
+    Computes validation loss and metrics (S, E, Fw, MAE)
+    
+    Args:
+        model: DualStream_PVT_COD
+        loader: DataLoader returning (rgb, depth, mask)
+        criterion: DeepSupervisionLoss
+        device: cuda/cpu
+        config: Config object
+    
+    Returns:
+        metrics: Dict with loss, S, E, Fw, MAE
     """
     model.eval()
     
     metrics = {
         "loss": 0.0,
-        "S": 0.0,     # S-measure
-        "E": 0.0,     # E-measure
-        "Fw": 0.0,     # F-measure
-        "MAE": 0.0    # Mean Absolute Error
+        "S": 0.0,
+        "E": 0.0,
+        "Fw": 0.0,
+        "MAE": 0.0
     }
     
     num_samples = 0
+    use_boundary_loss = config.is_bem
     
-    # Check if model supports boundary prediction
-    has_boundary = hasattr(model, 'predict_boundary') and model.predict_boundary
-    
-    for images, masks in loader:
-        images = images.to(device)
+    for rgb, depth, masks in loader:
+        rgb = rgb.to(device)
+        depth = depth.to(device)
         masks = masks.to(device)
         
         # Forward pass
-        if has_boundary:
-            mask_pred, boundary_pred = model(images, return_boundary=True)
-            
+        predictions, boundary_pred = model(rgb, depth)
+        pred_d1, pred_d2, pred_d3, pred_d4 = predictions
+        
+        if use_boundary_loss and boundary_pred is not None:
             # Extract ground truth boundary
             from models.boundary_enhancement import BoundaryEnhancementModule
             bem_temp = BoundaryEnhancementModule(channels=1).to(device)
             boundary_target = bem_temp.extract_boundary_map(masks)
+            boundary_target = torch.clamp(boundary_target, 0, 1)
             
-            loss = criterion(mask_pred, masks, boundary_pred, boundary_target)
+            # Compute loss with boundary
+            val_loss = criterion(pred_d1, pred_d2, pred_d3, pred_d4, 
+                                masks, boundary_pred, boundary_target)
         else:
-            mask_pred = model(images)
-            loss = criterion(mask_pred, masks)
+            # Compute loss without boundary
+            val_loss = criterion(pred_d1, pred_d2, pred_d3, pred_d4, 
+                                masks, None, None)
         
-        # Convert to probabilities
-        pred_probs = torch.sigmoid(mask_pred)
+        # Convert to probabilities (use d1 for metrics)
+        pred_probs = torch.sigmoid(pred_d1)
         
-        # Compute metrics for each sample in batch
-        batch_size = images.shape[0]
+        # Compute metrics for each sample
+        batch_size = rgb.shape[0]
         for i in range(batch_size):
             metrics["S"] += s_measure(pred_probs[i], masks[i]).item()
             metrics["E"] += e_measure(pred_probs[i], masks[i]).item()
             metrics["Fw"] += fw_measure(pred_probs[i], masks[i]).item()
-            metrics["MAE"] += mae_metric(mask_pred[i:i+1], masks[i:i+1]).item()
+            metrics["MAE"] += mae_metric(pred_d1[i:i+1], masks[i:i+1]).item()
         
-        metrics["loss"] += loss.item() * batch_size
+        metrics["loss"] += val_loss.item() * batch_size
         num_samples += batch_size
     
     # Average metrics
@@ -208,32 +220,30 @@ def validate(model, loader, criterion, device):
     
     return metrics
 
+
 # ===================== Optimizer Creation =====================
 
 def create_optimizer(model, config):
     """
-    Create optimizer with different learning rates for different parts
+    Create optimizer with different learning rates for encoder and decoder
+    
+    Encoder: RGB backbone + Depth backbone + BFM
+    Decoder: Decoder blocks + CBAM + BEM + Output heads
     """
-    # Separate encoder, DCN, CBAM, and other parameters
     encoder_params = []
-    dcn_params = []
-    cbam_params = []
-    other_params = []
+    decoder_params = []
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         
-        if 'backbone.encoder' in name:
+        # Encoder: dual_encoder (RGB backbone, Depth backbone, BFM)
+        if 'dual_encoder' in name:
             encoder_params.append(param)
-        elif 'dcn' in name.lower():
-            dcn_params.append(param)
-        elif 'cbam' in name.lower() or 'channel_attention' in name or 'spatial_attention' in name:
-            cbam_params.append(param)
         else:
-            other_params.append(param)
+            # Decoder: decoder blocks, CBAM, BEM, output heads
+            decoder_params.append(param)
     
-    # Create parameter groups
     param_groups = []
     
     if encoder_params:
@@ -244,29 +254,13 @@ def create_optimizer(model, config):
         })
         print(f"  Encoder params: {len(encoder_params)} tensors, LR={config.lr_encoder}")
     
-    if dcn_params:
+    if decoder_params:
         param_groups.append({
-            'params': dcn_params,
-            'lr': config.lr_dcn,
-            'name': 'dcn'
+            'params': decoder_params,
+            'lr': config.lr_decoder,
+            'name': 'decoder'
         })
-        print(f"  DCN params: {len(dcn_params)} tensors, LR={config.lr_dcn}")
-    
-    if cbam_params:
-        param_groups.append({
-            'params': cbam_params,
-            'lr': config.lr_dcn,  # Same as DCN
-            'name': 'cbam'
-        })
-        print(f"  CBAM params: {len(cbam_params)} tensors, LR={config.lr_dcn}")
-    
-    if other_params:
-        param_groups.append({
-            'params': other_params,
-            'lr': config.lr_dcn,
-            'name': 'other'
-        })
-        print(f"  Other params: {len(other_params)} tensors, LR={config.lr_dcn}")
+        print(f"  Decoder params: {len(decoder_params)} tensors, LR={config.lr_decoder}")
     
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -277,9 +271,7 @@ def create_optimizer(model, config):
 
 
 def create_scheduler(optimizer, config, num_batches):
-    """
-    Create learning rate scheduler
-    """
+    """Create learning rate scheduler"""
     if config.use_cosine_schedule:
         total_steps = config.epochs * num_batches
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -300,6 +292,8 @@ def create_scheduler(optimizer, config, num_batches):
 # ===================== Main Training Loop =====================
 
 def main():
+    """Main training function"""
+    
     # Initialize configuration
     config = Config()
     
@@ -308,28 +302,49 @@ def main():
     
     # Log configuration
     logger.info("="*80)
-    logger.info("TRAINING CONFIGURATION")
+    logger.info("DUALSTREAM PVT-COD TRAINING")
     logger.info("="*80)
-    logger.info(f"Model Name    : {config.model_name}")
+    logger.info(f"Model: DualStream_PVT_COD")
+    logger.info(f"  - RGB Backbone: PVT-v2-b2")
+    logger.info(f"  - Depth Backbone: PVT-v2-b0")
+    logger.info(f"  - BFM (Bi-directional Fusion): Enabled")
+    logger.info(f"  - CBAM (e3, e4): {config.is_cbam_en3}, {config.is_cbam_en4}")
+    logger.info(f"  - BEM (Boundary): {config.is_bem}")
     logger.info(f"Dataset Root  : {config.root}")
     logger.info(f"Image Size    : {config.img_size}")
+    logger.info(f"Use Depth     : {config.use_depth}")
     logger.info(f"Batch Size    : {config.batch_size}")
     logger.info(f"Epochs        : {config.epochs}")
     logger.info(f"Warmup Epochs : {config.warmup_epochs}")
-    logger.info(f"Warmup Boundary Epochs: {config.warmup_boundary_epochs}")
+    logger.info(f"Warmup Boundary: {config.warmup_boundary_epochs}")
     logger.info(f"LR Encoder    : {config.lr_encoder}")
-    logger.info(f"LR DCN        : {config.lr_dcn}")
-    logger.info(f"Loss Weights  : BCE={config.lambda_bce}, Dice={config.lambda_dice}, "
-                f"IoU={config.lambda_iou}, Focal={config.lambda_focal}, Boundary={config.lambda_boundary}")
-    logger.info(f"Focal Params  : alpha={config.focal_alpha}, gamma={config.focal_gamma}")
+    logger.info(f"LR Decoder    : {config.lr_decoder}")
+    logger.info(f"Loss Weights:")
+    logger.info(f"  wBCE: {config.lambda_wbce}, wIoU: {config.lambda_wiou}")
+    logger.info(f"  Boundary: {config.lambda_boundary}")
     logger.info(f"Device        : {config.device}")
     logger.info(f"Log Directory : {config.log_dir}")
     logger.info("="*80)
     
     # Create datasets
     logger.info("Loading datasets...")
-    train_dataset = MHCDDataset(config.root, "train", config.img_size, logger=logger)
-    val_dataset = MHCDDataset(config.root, "val", config.img_size, logger=logger)
+    train_dataset = MHCDDataset(
+        root=config.root,
+        split="train",
+        img_size=config.img_size,
+        augment=True,
+        use_depth=config.use_depth,
+        logger=logger
+    )
+    
+    val_dataset = MHCDDataset(
+        root=config.root,
+        split="val",
+        img_size=config.img_size,
+        augment=False,
+        use_depth=config.use_depth,
+        logger=logger
+    )
     
     logger.info(f"Train samples: {len(train_dataset)}")
     logger.info(f"Val samples  : {len(val_dataset)}")
@@ -352,8 +367,14 @@ def main():
     )
     
     # Create model
-    logger.info(f"Creating model: {config.model_name}")
-    model = create_model(config.model_name, config.device)
+    logger.info("Creating model...")
+    model = DualStream_PVT_COD(
+        n_classes=config.n_classes,
+        is_bem=config.is_bem,
+        is_cbam_en3=config.is_cbam_en3,
+        is_cbam_en4=config.is_cbam_en4,
+        pretrained=config.pretrained
+    ).to(config.device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -361,17 +382,14 @@ def main():
     logger.info(f"Total parameters    : {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
     
-    # Create optimizer, criterion, scheduler
-    optimizer = create_optimizer(model, config)
-    criterion = SegmentationLoss(
-        lambda_bce=config.lambda_bce,
-        lambda_dice=config.lambda_dice,
-        lambda_iou=config.lambda_iou,
-        lambda_focal=config.lambda_focal,
-        lambda_boundary=config.lambda_boundary,
-        focal_alpha=config.focal_alpha,
-        focal_gamma=config.focal_gamma
+    # Create loss, optimizer, scheduler
+    criterion = DeepSupervisionLoss(
+        lambda_wbce=config.lambda_wbce,
+        lambda_wiou=config.lambda_wiou,
+        lambda_boundary=config.lambda_boundary
     )
+    
+    optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config, len(train_loader))
     scaler = GradScaler()
     
@@ -404,7 +422,8 @@ def main():
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "val_loss", "S_measure", "E_measure", "fw_measure", "MAE"])
+            writer.writerow(["epoch", "train_loss", "val_loss", 
+                           "S_measure", "E_measure", "fw_measure", "MAE"])
     
     # Training loop
     logger.info("="*80)
@@ -418,13 +437,19 @@ def main():
         
         # Training phase
         if epoch <= config.warmup_epochs:
-            logger.info(f"[WARMUP] Encoder frozen, training attention modules only")
+            logger.info(f"[WARMUP] Encoder frozen")
         
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, config.device, config, epoch)
+        if epoch <= config.warmup_boundary_epochs:
+            logger.info(f"[WARMUP] Boundary loss disabled")
+        
+        train_loss = train_epoch(
+            model, train_loader, optimizer, criterion, 
+            scaler, config.device, config, epoch
+        )
         train_losses.append(train_loss)
         
         # Validation phase
-        val_metrics = validate(model, val_loader, criterion, config.device)
+        val_metrics = validate(model, val_loader, criterion, config.device, config)
         val_losses.append(val_metrics["loss"])
         val_metrics_history.append(val_metrics)
         

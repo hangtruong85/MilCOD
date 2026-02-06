@@ -129,10 +129,8 @@ class BEM_Multilevel(nn.Module):
         out_channels: Output channels (default: 64)
         predict_boundary: Whether to predict boundary map (default: False)
     """
-    def __init__(self, in_channels_list, out_channels=64, predict_boundary=False):
-        super().__init__()
-        
-        self.predict_boundary = predict_boundary
+    def __init__(self, in_channels_list, out_channels=64):
+        super().__init__()       
         
         # Handle single channel input (for compatibility with BoundaryEnhancementModule)
         if isinstance(in_channels_list, int):
@@ -218,15 +216,14 @@ class BEM_Multilevel(nn.Module):
         )
         
         # ===================== Boundary Prediction Head =====================
-        if predict_boundary:
-            self.boundary_head = nn.Sequential(
-                nn.Conv2d(out_channels, out_channels // 2, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_channels // 2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_channels // 2, 1, kernel_size=1)
-            )
+        self.boundary_head = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 2, 1, kernel_size=1)
+        )
     
-    def forward(self, x, return_boundary=False):
+    def forward(self, x):
         """
         Forward pass
         
@@ -303,11 +300,8 @@ class BEM_Multilevel(nn.Module):
         fe = self.output_conv(fe)
         
         # ===================== Boundary Prediction =====================
-        if return_boundary and self.predict_boundary:
-            boundary_pred = self.boundary_head(fe)
-            return fe, boundary_pred
-        else:
-            return fe
+        boundary_pred = self.boundary_head(fe)
+        return fe, boundary_pred
     
     def extract_boundary_map(self, x):
         """

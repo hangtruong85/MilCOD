@@ -628,202 +628,112 @@ class PVT_DeepSupervision(nn.Module):
                 return pred_d1, None
 
 class PVT_DeepSupervision_BEMMulti(nn.Module):
-    """
-    PVT-V2-B2 encoder + Deep Supervision + BEM_Multilevel + CBAM
-    
-    Architecture:
-    - Encoder: PVT-V2-B2 (4 stages)
-      ├─ Stage 1: 64 channels
-      ├─ Stage 2: 128 channels
-      ├─ Stage 3: 320 channels ← CBAM applied
-      └─ Stage 4: 512 channels ← CBAM applied
-    
-    - Decoder: 4 levels with full-scale skip connections
-      ├─ d4: e1 + e2 + e3 + e4
-      ├─ d3: e1 + e2 + e3 + d4
-      ├─ d2: e1 + e2 + d3 + d4
-      └─ d1: e1 + d2 + d3 + d4
-    
-    - BEM_Multilevel: Edge Exploration Module
-      └─ Takes [d1, d2, d3, d4] as multi-level input
-      └─ Multi-scale dilated convolutions (d=1, 3, 5)
-      └─ Retrieve Attention mechanism
-    
-    - Deep Supervision: Output heads at all decoder levels
-    
-    Args:
-        n_classes: Number of output classes (default: 1)
-        predict_boundary: Whether to predict boundary (default: True)
-    """
-    def __init__(self, n_classes=1, predict_boundary=True):
+    def __init__(self, n_classes=1, is_bem=True, is_cbam_en3=True, is_cbam_en4=True):  
         super().__init__()
         
         # ================== ENCODER ==================
-        # Load PVT-V2-B2 from timm
         self.backbone = timm.create_model('pvt_v2_b2', pretrained=True, features_only=True)
-        
-        # PVT-V2-B2 output channels: [64, 128, 320, 512]
         encoder_channels = [3, 64, 128, 320, 512]
         
         # ================== CBAM ==================
-        # CBAM modules for encoder levels 3 & 4 (deep semantic features)
-        self.cbam_e3 = CBAM(encoder_channels[3])  # 320 channels
-        self.cbam_e4 = CBAM(encoder_channels[4])  # 512 channels
+        self.cbam_e3 = CBAM(encoder_channels[3])
+        self.cbam_e4 = CBAM(encoder_channels[4])
+        
+        # ================== FLAGS ==================
+        self.is_bem = is_bem
+        self.is_cbam_en3 = is_cbam_en3
+        self.is_cbam_en4 = is_cbam_en4
         
         # ================== DECODER ==================
         decoder_channels = 64
         
-        # Decoder blocks with full-scale skip connections
-        # d4 = e1 + e2 + e3 + e4
         self.decoder4 = DecoderBlock(
-            in_channels_list=[
-                encoder_channels[1],  # e1: 64
-                encoder_channels[2],  # e2: 128
-                encoder_channels[3],  # e3: 320
-                encoder_channels[4]   # e4: 512
-            ],
+            in_channels_list=[encoder_channels[1], encoder_channels[2], 
+                            encoder_channels[3], encoder_channels[4]],
             out_channels=decoder_channels
         )
         
-        # d3 = e1 + e2 + e3 + d4
         self.decoder3 = DecoderBlock(
-            in_channels_list=[
-                encoder_channels[1],  # e1: 64
-                encoder_channels[2],  # e2: 128
-                encoder_channels[3],  # e3: 320
-                decoder_channels      # d4: 64
-            ],
+            in_channels_list=[encoder_channels[1], encoder_channels[2], 
+                            encoder_channels[3], decoder_channels],
             out_channels=decoder_channels
         )
         
-        # d2 = e1 + e2 + d3 + d4
         self.decoder2 = DecoderBlock(
-            in_channels_list=[
-                encoder_channels[1],  # e1: 64
-                encoder_channels[2],  # e2: 128
-                decoder_channels,     # d3: 64
-                decoder_channels      # d4: 64
-            ],
+            in_channels_list=[encoder_channels[1], encoder_channels[2], 
+                            decoder_channels, decoder_channels],
             out_channels=decoder_channels
         )
         
-        # d1 = e1 + d2 + d3 + d4
         self.decoder1 = DecoderBlock(
-            in_channels_list=[
-                encoder_channels[1],  # e1: 64
-                decoder_channels,     # d2: 64
-                decoder_channels,     # d3: 64
-                decoder_channels      # d4: 64
-            ],
+            in_channels_list=[encoder_channels[1], decoder_channels, 
+                            decoder_channels, decoder_channels],
             out_channels=decoder_channels
         )
         
         # ================== BEM_Multilevel ==================
-        # Edge Exploration Module with multi-level input
-        # Takes [d1, d2, d3, d4] as input
-        self.predict_boundary = predict_boundary
-        self.bem = BEM_Multilevel(
-            in_channels_list=[decoder_channels, decoder_channels, decoder_channels, decoder_channels],
-            out_channels=decoder_channels,
-            predict_boundary=predict_boundary
-        )
+        if self.is_bem:  # ✅ Chỉ tạo BEM khi cần
+            self.bem = BEM_Multilevel(
+                in_channels_list=[decoder_channels] * 4,
+                out_channels=decoder_channels
+            )
         
         # ================== DEEP SUPERVISION HEADS ==================
-        # Output heads for each decoder level
         self.out_d4 = nn.Conv2d(decoder_channels, n_classes, 1)
         self.out_d3 = nn.Conv2d(decoder_channels, n_classes, 1)
         self.out_d2 = nn.Conv2d(decoder_channels, n_classes, 1)
         self.out_d1 = nn.Conv2d(decoder_channels, n_classes, 1)
     
-    def forward(self, x, return_all_levels=False, return_boundary=False):
+    def forward(self, x):
         """
-        Forward pass with deep supervision
-        
         Args:
             x: Input image (B, 3, H, W)
-            return_all_levels: Whether to return predictions from all decoder levels
-                              If True, returns (d1, d2, d3, d4)
-                              If False, returns only d1 (final prediction)
-            return_boundary: Whether to return boundary prediction
-        
         Returns:
-            If return_all_levels=False:
-                mask: Final segmentation (B, 1, H, W)
-                or (mask, boundary) if return_boundary=True
-            
-            If return_all_levels=True:
-                (pred_d1, pred_d2, pred_d3, pred_d4): All level predictions
-                or ((pred_d1, pred_d2, pred_d3, pred_d4), boundary) if return_boundary=True
+            predictions: (pred_d1, pred_d2, pred_d3, pred_d4) - all upsampled to input_size
+            boundary_pred: Boundary prediction (B, 1, H, W) or None
         """
         input_size = x.shape[2:]
         
         # ================== ENCODER ==================
-        features = self.backbone(x)  # [e1, e2, e3, e4]
+        features = self.backbone(x)
         
-        # Apply CBAM to encoder levels 3 & 4
-        e1 = features[0]                    # e1 (no CBAM)
-        e2 = features[1]                    # e2 (no CBAM)
-        e3 = self.cbam_e3(features[2])      # e3 (with CBAM)
-        e4 = self.cbam_e4(features[3])      # e4 (with CBAM)
+        e1 = features[0]
+        e2 = features[1]
+        e3 = self.cbam_e3(features[2]) if self.is_cbam_en3 else features[2]
+        e4 = self.cbam_e4(features[3]) if self.is_cbam_en4 else features[3]
         
         # ================== DECODER ==================
-        # Calculate target sizes for each decoder level
         size_d4 = (e4.shape[2], e4.shape[3])
         size_d3 = (e3.shape[2], e3.shape[3])
         size_d2 = (e2.shape[2], e2.shape[3])
         size_d1 = (e1.shape[2], e1.shape[3])
         
-        # Decoder forward
-        # d4 = e1 + e2 + e3 + e4
         d4 = self.decoder4([e1, e2, e3, e4], size_d4)
-        
-        # d3 = e1 + e2 + e3 + d4
         d3 = self.decoder3([e1, e2, e3, d4], size_d3)
-        
-        # d2 = e1 + e2 + d3 + d4
         d2 = self.decoder2([e1, e2, d3, d4], size_d2)
-        
-        # d1 = e1 + d2 + d3 + d4
         d1 = self.decoder1([e1, d2, d3, d4], size_d1)
         
-        # Upsample d1 to input size
-        d1_upsampled = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
-        
         # ================== BEM_Multilevel ==================
-        # Upsample all decoder features to input size for BEM
-        d2_upsampled = F.interpolate(d2, size=input_size, mode='bilinear', align_corners=True)
-        d3_upsampled = F.interpolate(d3, size=input_size, mode='bilinear', align_corners=True)
-        d4_upsampled = F.interpolate(d4, size=input_size, mode='bilinear', align_corners=True)
-        
-        # BEM takes multi-level decoder features [d1, d2, d3, d4]
-        # d1 is highest resolution, d4 is lowest
-        if return_boundary and self.predict_boundary:
+        if self.is_bem:
+            # Upsample all decoder features to input size for BEM
+            d1_up = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
+            d2_up = F.interpolate(d2, size=input_size, mode='bilinear', align_corners=True)
+            d3_up = F.interpolate(d3, size=input_size, mode='bilinear', align_corners=True)
+            d4_up = F.interpolate(d4, size=input_size, mode='bilinear', align_corners=True)
+            
             decoder_output, boundary_pred = self.bem(
-                [d1_upsampled, d2_upsampled, d3_upsampled, d4_upsampled], 
-                return_boundary=True
+                [d1_up, d2_up, d3_up, d4_up]
             )
         else:
-            decoder_output = self.bem(
-                [d1_upsampled, d2_upsampled, d3_upsampled, d4_upsampled], 
-                return_boundary=False
-            )
+            # ✅ Nếu không dùng BEM, upsample d1 về input_size
+            decoder_output = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
             boundary_pred = None
         
         # ================== DEEP SUPERVISION OUTPUTS ==================
-        # Output predictions from all levels
-        pred_d4 = self.out_d4(d4)
-        pred_d3 = self.out_d3(d3)
-        pred_d2 = self.out_d2(d2)
-        pred_d1 = self.out_d1(decoder_output)  # Final output after BEM
+        # ✅ Tất cả predictions đều được upsample về input_size
+        pred_d4 = F.interpolate(self.out_d4(d4), size=input_size, mode='bilinear', align_corners=True)
+        pred_d3 = F.interpolate(self.out_d3(d3), size=input_size, mode='bilinear', align_corners=True)
+        pred_d2 = F.interpolate(self.out_d2(d2), size=input_size, mode='bilinear', align_corners=True)
+        pred_d1 = self.out_d1(decoder_output)  # Already at input_size
         
-        # ================== RETURN ==================
-        if return_all_levels:
-            if return_boundary and self.predict_boundary:
-                return (pred_d1, pred_d2, pred_d3, pred_d4), boundary_pred
-            else:
-                return (pred_d1, pred_d2, pred_d3, pred_d4), None
-        else:
-            if return_boundary and self.predict_boundary:
-                return pred_d1, boundary_pred
-            else:
-                return pred_d1, None
+        return (pred_d1, pred_d2, pred_d3, pred_d4), boundary_pred
