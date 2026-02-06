@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Model checkpoints and outputs
+*.pth
+*.pt
+eval_results/
+logs/
+visualizations/

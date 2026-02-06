@@ -1,0 +1,26 @@
+name: unetcod
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch=2.8.*
+  - torchvision=0.19.*
+  - pytorch-cuda=12.8    # phù hợp RTX 5090 + CUDA 12.x
+  - cudnn
+  - numpy
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - pandas
+  - matplotlib
+  - pillow
+  - opencv
+  - pip
+  - tqdm
+  - tensorboard
+  - pip:
+      - segmentation-models-pytorch
+      - albumentations
+      - einops
