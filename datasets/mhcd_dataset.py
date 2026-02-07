@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-class MHCDDataset(Dataset):
+class MHCDDatasetWithDepth(Dataset):
     """
     MHCD Dataset with RGB + Depth + Mask support
     Uses ReplayCompose to ensure synchronized augmentation
@@ -144,9 +144,8 @@ class MHCDDataset(Dataset):
         img = cv2.imread(self.img_paths[idx])
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Load mask
+        # Load mask (keep original 0-255 range for augmentation)
         mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
-        mask = (mask > 127).astype("uint8")  # Binary {0, 1}
         
         # Load depth
         if self.use_depth:
@@ -173,7 +172,7 @@ class MHCDDataset(Dataset):
         # Normalize depth to [0, 1]
         depth = depth.astype("float32") / 255.0
         
-        # Binarize mask
+        # Binarize mask (mask is in 0-255 range after resize)
         mask = (mask > 127).astype("float32")
         
         # Convert to tensors
@@ -183,7 +182,7 @@ class MHCDDataset(Dataset):
         
         return img, depth, mask
 
-class MHCDDataset_old(Dataset):
+class MHCDDataset(Dataset):
     def __init__(self, root, split="train", img_size=256, augment=True, logger=None):
         self.img_dir = os.path.join(root, split, "images")
         self.mask_dir = os.path.join(root, split, "masks")

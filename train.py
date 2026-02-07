@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from datetime import datetime
 
-from datasets.mhcd_dataset import MHCDDataset
+from datasets.mhcd_dataset import MHCDDatasetWithDepth
 from models.dual_stream_pvt import DualStream_PVT_COD
 
 from metrics.s_measure_paper import s_measure
@@ -60,8 +60,8 @@ class Config:
         self.lambda_boundary = 4.0      # Boundary loss multiplier
 
         # Training strategy
-        self.warmup_epochs = 0           # Freeze encoder for first N epochs
-        self.warmup_boundary_epochs = 0 # Start boundary loss after N epochs
+        self.warmup_epochs = 5           # Freeze encoder for first N epochs
+        self.warmup_boundary_epochs = 20 # Start boundary loss after N epochs
         self.use_cosine_schedule = True  # Use cosine LR schedule
         
         # Device
@@ -204,13 +204,39 @@ def validate(model, loader, criterion, device, config):
         # Convert to probabilities (use d1 for metrics)
         pred_probs = torch.sigmoid(pred_d1)
         
+        # DEBUG: Print detailed stats for first batch to diagnose F=0 issue
+        if num_samples == 0:
+            print(f"\n  ===== [DEBUG VALIDATE - First Batch] =====")
+            print(f"  pred_d1 dtype: {pred_d1.dtype}, range: [{pred_d1.min().item():.6f}, {pred_d1.max().item():.6f}]")
+            print(f"  pred_probs dtype: {pred_probs.dtype}, range: [{pred_probs.min().item():.6f}, {pred_probs.max().item():.6f}]")
+            print(f"  masks dtype: {masks.dtype}, range: [{masks.min().item():.6f}, {masks.max().item():.6f}]")
+            print(f"  masks unique (sample 0): {torch.unique(masks[0]).cpu().tolist()[:10]}")
+            print(f"  masks[0] (gt==0).sum(): {(masks[0]==0).sum().item()}")
+            print(f"  masks[0] (gt==1).sum(): {(masks[0]==1).sum().item()}")
+            print(f"  masks[0] (gt>0.5).sum(): {(masks[0]>0.5).sum().item()}")
+            print(f"  masks[0] total pixels: {masks[0].numel()}")
+            unaccounted = masks[0].numel() - (masks[0]==0).sum().item() - (masks[0]==1).sum().item()
+            print(f"  masks[0] pixels NEITHER 0 nor 1: {unaccounted}")
+            # Test fw_measure inline
+            test_pred = pred_probs[0].squeeze()
+            test_gt = masks[0].squeeze()
+            print(f"  After squeeze: pred shape={test_pred.shape}, gt shape={test_gt.shape}")
+            print(f"  torch.all(gt==0): {torch.all(test_gt==0).item()}")
+            gt_fg_count = (test_gt == 1).sum().item()
+            print(f"  (gt==1).sum() in squeezed gt: {gt_fg_count}")
+            if gt_fg_count == 0 and not torch.all(test_gt == 0):
+                print(f"  ⚠️ GT has foreground pixels but NONE are exactly 1.0!")
+                print(f"  ⚠️ This causes R=0 → F=0 in cal_wfm!")
+                print(f"  ⚠️ GT non-zero values sample: {test_gt[test_gt>0][:5].cpu().tolist()}")
+            print(f"  ========================================\n")
+        
         # Compute metrics for each sample
         batch_size = rgb.shape[0]
         for i in range(batch_size):
             metrics["S"] += s_measure(pred_probs[i], masks[i]).item()
             metrics["E"] += e_measure(pred_probs[i], masks[i]).item()
             metrics["Fw"] += fw_measure(pred_probs[i], masks[i]).item()
-            metrics["MAE"] += mae_metric(pred_d1[i:i+1], masks[i:i+1]).item()
+            metrics["MAE"] += mae_metric(pred_probs[i:i+1], masks[i:i+1]).item()
         
         metrics["loss"] += val_loss.item() * batch_size
         num_samples += batch_size
@@ -330,7 +356,7 @@ def main():
     
     # Create datasets
     logger.info("Loading datasets...")
-    train_dataset = MHCDDataset(
+    train_dataset = MHCDDatasetWithDepth(
         root=config.root,
         split="train",
         img_size=config.img_size,
@@ -339,7 +365,7 @@ def main():
         logger=logger
     )
     
-    val_dataset = MHCDDataset(
+    val_dataset = MHCDDatasetWithDepth(
         root=config.root,
         split="val",
         img_size=config.img_size,
@@ -347,7 +373,7 @@ def main():
         use_depth=config.use_depth,
         logger=logger
     )
-    
+   
     logger.info(f"Train samples: {len(train_dataset)}")
     logger.info(f"Val samples  : {len(val_dataset)}")
     
@@ -517,4 +543,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()
