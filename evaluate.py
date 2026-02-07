@@ -11,7 +11,7 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 
-from datasets.mhcd_dataset import MHCDDataset
+from datasets.mhcd_dataset import MHCDDatasetWithDepth
 from models.dual_stream_pvt import DualStream_PVT_COD
 
 from metrics.s_measure_paper import s_measure
@@ -35,11 +35,11 @@ class EvalConfig:
         self.pretrained = False  # Not needed for evaluation
         
         # Checkpoint path
-        self.ckpt_path = "logs/DualStream_PVT_COD_20260206_172339/best_s_measure.pth"
+        self.ckpt_path = "logs/DualStream_PVT_COD_20260207_081637/best_s_measure.pth"
         
         # Dataset
         self.root = "../MHCD_seg"
-        self.split = "val"  # or "test" if available
+        self.split = "test"  # or "test" if available
         self.img_size = 352
         self.batch_size = 12
         self.use_depth = True  # Load depth maps
@@ -102,8 +102,8 @@ class MetricsAccumulator:
     def __init__(self):
         self.metrics = {
             "S": [],      # S-measure (Structure)
-            "E": [],      # E-measure (Enhanced-alignment)
             "Fw": [],     # Weighted F-measure
+            "E": [],      # E-measure (Enhanced-alignment)
             "MAE": []     # Mean Absolute Error
         }
     
@@ -204,7 +204,7 @@ def display_results(summary, logger):
     print("EVALUATION RESULTS")
     print("="*80)
     
-    metrics_order = ['S', 'E', 'Fw', 'MAE']
+    metrics_order = ['S', 'Fw', 'E', 'MAE']
     
     print("\nMetrics (Mean ± Std):")
     print("-" * 80)
@@ -318,7 +318,7 @@ def main():
     
     # Create dataset
     logger.info(f"\nLoading dataset: {config.split}")
-    dataset = MHCDDataset(
+    dataset = MHCDDatasetWithDepth(
         root=config.root,
         split=config.split,
         img_size=config.img_size,
@@ -363,8 +363,8 @@ def main():
     print("EVALUATION SUMMARY")
     print("="*80)
     print(f"S-measure : {summary['S_mean']:.4f}")
-    print(f"E-measure : {summary['E_mean']:.4f}")
     print(f"Fw-measure: {summary['Fw_mean']:.4f}")
+    print(f"E-measure : {summary['E_mean']:.4f}")
     print(f"MAE       : {summary['MAE_mean']:.4f}")
     print("="*80)
 
