@@ -36,6 +36,7 @@ class Config:
         self.is_bem = True           # Use Boundary Enhancement Module
         self.is_cbam_en3 = True      # Use CBAM on encoder stage 3
         self.is_cbam_en4 = True      # Use CBAM on encoder stage 4
+        self.is_fft = False      # Use fft after encoder stage 4
         self.pretrained = True       # Use pretrained PVT backbones
         
         # Dataset
@@ -59,8 +60,8 @@ class Config:
         self.lambda_boundary = 4.0      # Boundary loss multiplier
 
         # Training strategy
-        self.warmup_epochs = 5           # Freeze encoder for first N epochs
-        self.warmup_boundary_epochs = 20 # Start boundary loss after N epochs
+        self.warmup_epochs = 0           # Freeze encoder for first N epochs
+        self.warmup_boundary_epochs = 0 # Start boundary loss after N epochs
         self.use_cosine_schedule = True  # Use cosine LR schedule
         
         # Device
@@ -309,6 +310,7 @@ def main():
     logger.info(f"  - Depth Backbone: PVT-v2-b0")
     logger.info(f"  - BFM (Bi-directional Fusion): Enabled")
     logger.info(f"  - CBAM (e3, e4): {config.is_cbam_en3}, {config.is_cbam_en4}")
+    logger.info(f"  - Fourier Transform: {config.is_fft}")
     logger.info(f"  - BEM (Boundary): {config.is_bem}")
     logger.info(f"Dataset Root  : {config.root}")
     logger.info(f"Image Size    : {config.img_size}")
@@ -373,6 +375,7 @@ def main():
         is_bem=config.is_bem,
         is_cbam_en3=config.is_cbam_en3,
         is_cbam_en4=config.is_cbam_en4,
+        is_fft=config.is_fft,
         pretrained=config.pretrained
     ).to(config.device)
     
